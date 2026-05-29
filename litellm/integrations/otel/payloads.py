@@ -238,13 +238,14 @@ class ServiceSpanData:
     ) -> "ServiceSpanData":
         # ``payload.service`` is a ``ServiceTypes(str, Enum)`` and ``error`` is
         # ``Optional[str]`` on the Pydantic model — no defensive reads needed.
-        # ``str(value)`` covers every case (``str(None) == "None"``).
-        coerced = {key: str(value) for key, value in (event_metadata or {}).items()}
+        # ``event_metadata`` is sanitized: the legacy service decorators pass raw
+        # call-site data (live objects, full request metadata, response headers),
+        # none of which belongs on a span.
         return cls(
             service_name=payload.service.value,
             call_type=payload.call_type,
             error=SpanError(message=payload.error) if payload.error else None,
-            event_metadata=coerced,
+            event_metadata=sanitize_event_metadata(event_metadata),
         )
 
 
@@ -340,6 +341,58 @@ class LLMCallSpanData:
             choices_out=choices_out if capture_content else (),
             system_fingerprint=as_str(response.get("system_fingerprint")),
         )
+
+
+# --- service event_metadata sanitization ------------------------------------ #
+
+# Substrings (case-insensitive) of keys that must never reach a span: secrets,
+# tokens, and raw request/response dumps the legacy service decorators pass.
+_SENSITIVE_METADATA_SUBSTRINGS: tuple[str, ...] = (
+    "api_key",
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "authorization",
+    "header",
+    "hidden_params",
+)
+# Keys that carry raw call-site internals — live objects, full kwargs/args. The
+# operation name is already the span's ``call_type``, so ``function_name`` is
+# redundant.
+_DROP_METADATA_KEYS: frozenset = frozenset(
+    {"function_kwargs", "function_args", "function_name"}
+)
+_MAX_METADATA_VALUE_LEN = 1024
+_MAX_METADATA_ITEMS = 32
+
+
+def sanitize_event_metadata(
+    event_metadata: Mapping[str, object] | None,
+) -> dict[str, str]:
+    """Reduce caller-supplied ``event_metadata`` to span-safe string attributes.
+
+    Keeps only primitive values (str/int/float/bool) under non-sensitive keys —
+    never ``repr()``-ing objects, dicts, or lists, never stamping secrets/headers,
+    and bounding the count and per-value length. This is the single chokepoint:
+    both the GenAI and legacy mappers read the cleaned result.
+    """
+    if not event_metadata:
+        return {}
+    clean: dict[str, str] = {}
+    for key, value in event_metadata.items():
+        if len(clean) >= _MAX_METADATA_ITEMS:
+            break
+        if not isinstance(key, str) or key in _DROP_METADATA_KEYS:
+            continue
+        lowered = key.lower()
+        if any(token in lowered for token in _SENSITIVE_METADATA_SUBSTRINGS):
+            continue
+        # ``bool`` is a subclass of ``int``, so it's covered. Non-primitive values
+        # (objects, dicts, lists) are dropped rather than stringified.
+        if isinstance(value, (str, int, float)):
+            clean[key] = str(value)[:_MAX_METADATA_VALUE_LEN]
+    return clean
 
 
 def _json_or_none(value: object) -> str | None:

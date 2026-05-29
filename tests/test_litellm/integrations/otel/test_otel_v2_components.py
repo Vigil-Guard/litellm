@@ -41,9 +41,11 @@ from litellm.integrations.otel.spans import (  # noqa: E402
     LiteLLMSpanKind,
     SpanRole,
     SpanSpec,
+    db_system,
     guardrail_span_name,
     proxy_request_span_name,
     service_span_name,
+    span_role_for_service,
     validate_registry,
 )
 from litellm.integrations.otel.utils import (  # noqa: E402
@@ -404,3 +406,56 @@ def test_emitter_without_call_id_is_not_deduped():
     engine.emit(SpanRole.LLM_CALL, data)
     engine.emit(SpanRole.LLM_CALL, data)  # no call_id -> not deduped
     assert len(exporter.get_finished_spans()) == 2
+
+
+# --- service taxonomy: which calls become spans, and of what kind ----------- #
+
+
+def test_span_role_for_service_classifies_datastores_internal_and_metrics_only():
+    # Outbound datastores -> DB_CALL (CLIENT), with a db.system.
+    for name in (
+        "redis",
+        "postgres",
+        "batch_write_to_db",
+        "redis_daily_spend_update_queue",
+    ):
+        assert span_role_for_service(name) is SpanRole.DB_CALL
+        assert db_system(name) is not None
+    # Genuine internal work worth a span -> SERVICE (INTERNAL).
+    assert span_role_for_service("reset_budget_job") is SpanRole.SERVICE
+    assert db_system("reset_budget_job") is None
+    # Framework instrumentation that duplicates a gen-AI span (or gets a live
+    # phase span) -> None: never emitted as a service span.
+    for name in ("self", "router", "proxy_pre_call", "auth"):
+        assert span_role_for_service(name) is None
+
+
+# --- event_metadata sanitization -------------------------------------------- #
+
+
+def test_sanitize_event_metadata_drops_objects_dumps_and_secrets():
+    from litellm.integrations.otel.payloads import sanitize_event_metadata
+
+    clean = sanitize_event_metadata(
+        {
+            "table_name": "combined_view",  # safe primitive -> kept
+            "count": 3,  # primitive -> kept (stringified)
+            "function_kwargs": {"prisma_client": object()},  # denylisted key
+            "function_args": (1, 2),  # denylisted key
+            "user_api_key_auth": "blob",  # 'auth' substring -> dropped
+            "api_key": "sk-secret",  # 'api_key' substring -> dropped
+            "set-cookie": "x",  # 'cookie' substring -> dropped
+            "hidden_params": "headers...",  # denylisted substring
+            "obj": object(),  # non-primitive value -> dropped
+            "nested": {"x": 1},  # non-primitive value -> dropped
+        }
+    )
+    assert clean == {"table_name": "combined_view", "count": "3"}
+
+
+def test_sanitize_event_metadata_caps_value_length_and_handles_none():
+    from litellm.integrations.otel.payloads import sanitize_event_metadata
+
+    assert sanitize_event_metadata(None) == {}
+    big = sanitize_event_metadata({"k": "v" * 5000})
+    assert len(big["k"]) == 1024

@@ -557,6 +557,26 @@ class ProxyLogging:
         for idx, initialized_callback in string_callbacks_to_replace.items():
             litellm.callbacks[idx] = initialized_callback
 
+        # Fan ``litellm.callbacks`` (the "all events" registry) out into the
+        # success/failure event lists eagerly, at startup. ``completion()`` does
+        # this lazily in ``function_setup`` on the first call, but request paths
+        # that build their own logging object and never run ``function_setup`` —
+        # notably pass-through endpoints — read ``litellm._async_success_callback``
+        # directly. Without this, a config-registered logger (e.g. ``otel``) is
+        # invisible to pass-through traffic until some other request warms the
+        # global lists. The manager dedupes, so this is idempotent with
+        # ``function_setup``.
+        for callback in litellm.callbacks:
+            if isinstance(callback, CustomLogger):
+                litellm.logging_callback_manager.add_litellm_success_callback(callback)
+                litellm.logging_callback_manager.add_litellm_failure_callback(callback)
+                litellm.logging_callback_manager.add_litellm_async_success_callback(
+                    callback
+                )
+                litellm.logging_callback_manager.add_litellm_async_failure_callback(
+                    callback
+                )
+
     async def update_request_status(
         self, litellm_call_id: str, status: Literal["success", "fail"]
     ):

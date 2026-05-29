@@ -118,7 +118,8 @@ def test_async_log_success_event_emits_llm_call_span():
     assert span.attributes[GenAI.OPERATION_NAME] == "chat"
     assert span.attributes[GenAI.REQUEST_MODEL] == "gpt-4o"
     assert span.attributes[LiteLLM.CALL_ID] == "call_1"
-    assert span.status.status_code is StatusCode.OK
+    # Success leaves status UNSET (semconv default), not forced OK.
+    assert span.status.status_code is StatusCode.UNSET
 
 
 def test_async_log_failure_event_marks_error_status():
@@ -342,7 +343,8 @@ def test_async_service_success_hook_emits_service_span():
     assert span.attributes["key1"] == "val1"
     assert span.attributes["service"] == "redis"  # V1 bare key
     assert span.attributes["call_type"] == "set"  # V1 bare key
-    assert span.status.status_code is StatusCode.OK
+    # Success leaves status UNSET (semconv default), not forced OK.
+    assert span.status.status_code is StatusCode.UNSET
 
 
 def test_async_service_failure_hook_marks_error_status():
@@ -421,21 +423,37 @@ def test_background_service_call_with_timing_emits_root_span():
 
 
 def test_internal_service_call_is_internal_kind_without_db_attrs():
-    """A genuinely internal service (router) is an INTERNAL span with no db.*."""
+    """A genuine internal service (background job) is an INTERNAL span, no db.*."""
     logger, exporter = _logger()
     asyncio.run(
         logger.async_service_success_hook(
-            payload=_ServicePayload("router", "acompletion"),
+            payload=_ServicePayload("reset_budget_job", "reset_budget"),
             parent_otel_span=None,
             start_time=1.0,
             end_time=2.0,
         )
     )
     span = exporter.get_finished_spans()[0]
-    assert span.name == "router acompletion"
+    assert span.name == "reset_budget_job reset_budget"
     assert span.kind is SpanKind.INTERNAL
     assert "db.system.name" not in span.attributes
-    assert span.attributes[LiteLLM.SERVICE_NAME] == "router"
+    assert span.attributes[LiteLLM.SERVICE_NAME] == "reset_budget_job"
+
+
+def test_metrics_only_services_emit_no_span():
+    """self / router / proxy_pre_call / auth duplicate gen-AI spans or get a live
+    phase span — they are metrics-only and must not produce a service span."""
+    for service in ("self", "router", "proxy_pre_call", "auth"):
+        logger, exporter = _logger()
+        asyncio.run(
+            logger.async_service_success_hook(
+                payload=_ServicePayload(service, "x"),
+                parent_otel_span=None,
+                start_time=1.0,
+                end_time=2.0,
+            )
+        )
+        assert exporter.get_finished_spans() == (), f"{service} should emit no span"
 
 
 def test_service_span_inherits_parent_when_provided():

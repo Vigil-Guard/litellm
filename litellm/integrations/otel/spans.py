@@ -5,11 +5,12 @@ Span-name patterns live here as typed builder functions.
 
 Canonical hierarchy::
 
-    PROXY_REQUEST  (SERVER, root)   # owned by the FastAPI instrumentor
+    PROXY_REQUEST  (SERVER, root)     # owned by the FastAPI instrumentor
+    ├── SERVICE    (INTERNAL)         # auth phase span (live; see logger.phase_span)
+    │   └── DB_CALL (CLIENT)          #   its key/user/team lookups nest here
+    ├── GUARDRAIL  (INTERNAL)         # request-lifecycle hook, sibling of LLM_CALL
     ├── LLM_CALL   (CLIENT)
-    ├── GUARDRAIL  (INTERNAL)   # request-lifecycle hook, sibling of LLM_CALL
-    ├── DB_CALL    (CLIENT)     # outbound datastore call (redis/postgres)
-    └── SERVICE    (INTERNAL)   # litellm-internal work (router, budget jobs, …)
+    └── DB_CALL    (CLIENT)           # e.g. the spend-log write
 
 Guardrails parent to PROXY_REQUEST, not LLM_CALL: pre/during/post-call guardrail
 hooks are orchestrated by the request lifecycle (a pre-call guardrail runs
@@ -17,13 +18,19 @@ before the LLM call even starts), so a guardrail is a sibling of the LLM call,
 not a child of it. The emitter parents every span to the ambient OTel context
 (the active server span), which matches this.
 
-Service calls are split into two roles by :func:`service_kind`. An outbound call
-to an external datastore (redis, postgres) is a ``DB_CALL`` — a CLIENT span that
-carries ``db.*`` semconv attributes. Genuinely internal litellm operations
-(``self``, ``router``, budget/reset jobs, the pod-lock manager, in-memory
-queues) are ``SERVICE`` — INTERNAL spans. Both are built from the same
-``ServiceSpanData``; only the role (hence span kind and attribute vocabulary)
-differs. Unlike the LLM-call and guardrail spans, a service call can fire
+Not every service call becomes a span — :func:`span_role_for_service` decides:
+
+- ``DB_CALL`` (CLIENT) — outbound datastores (redis, postgres,
+  ``batch_write_to_db``), carrying ``db.*`` semconv.
+- ``SERVICE`` (INTERNAL) — genuine internal work worth a span (background
+  budget/reset jobs, pod-lock manager).
+- ``None`` (metrics-only) — framework instrumentation that duplicates a gen-AI
+  span (``self`` = the ``track_llm_api_timing`` wrapper, ``router``,
+  ``proxy_pre_call``) or ``auth`` (which gets a live phase span instead). These
+  still feed Prometheus/Datadog; they just never enter the trace.
+
+``DB_CALL`` and ``SERVICE`` are built from the same ``ServiceSpanData``; only the
+role (hence span kind and attribute vocabulary) differs. A service call can fire
 outside any request (a background job), in which case it parents to no server
 span and starts its own root trace rather than being dropped.
 
@@ -111,8 +118,34 @@ def db_system(service_name: str) -> str | None:
     return None
 
 
-def service_kind(service_name: str) -> SpanRole:
-    """Role for a service call: ``DB_CALL`` for datastores, else ``SERVICE``."""
+# ``ServiceTypes`` values that are NOT emitted as spans — they are framework
+# instrumentation that either duplicates a gen-AI span or has a better home as a
+# Prometheus/Datadog metric. They still flow to those metric backends via their
+# own hooks; the v2 logger just does not put them in the trace:
+#
+#   - ``self``           — ``track_llm_api_timing`` wraps the LLM call; the
+#                          ``chat {model}`` CLIENT span already represents it.
+#   - ``router``         — wraps the whole request; duplicates the server span.
+#   - ``proxy_pre_call`` — per-callback pre-call timing; a guardrail's real span
+#                          is ``execute_guardrail {name}``.
+#   - ``auth``           — emitted instead as a live phase span (see
+#                          ``logger.phase_span``) so its DB lookups nest under it,
+#                          not as a flat post-hoc service span.
+_METRICS_ONLY_SERVICES: frozenset[str] = frozenset(
+    {"self", "router", "proxy_pre_call", "auth"}
+)
+
+
+def span_role_for_service(service_name: str) -> SpanRole | None:
+    """The span role for a service call, or ``None`` when it must not be a span.
+
+    ``DB_CALL`` for outbound datastores, ``SERVICE`` for genuine internal work
+    worth a span (background jobs), and ``None`` for framework instrumentation
+    that duplicates a gen-AI span or belongs in metrics only
+    (see ``_METRICS_ONLY_SERVICES``).
+    """
+    if service_name in _METRICS_ONLY_SERVICES:
+        return None
     return SpanRole.DB_CALL if db_system(service_name) is not None else SpanRole.SERVICE
 
 

@@ -77,7 +77,8 @@ def test_llm_call_span_golden():
     assert a["server.address"] == "api.openai.com"
     assert a[LiteLLM.CALL_ID] == "call_1"
     assert a["litellm.cost.total"] == 0.002
-    assert span.status.status_code is StatusCode.OK
+    # Success leaves status UNSET (semconv default), not forced OK.
+    assert span.status.status_code is StatusCode.UNSET
 
 
 def test_legacy_dual_emit_on():
@@ -215,7 +216,8 @@ def test_guardrail_block_span_is_error_and_carries_verdict():
     assert a[LiteLLM.GUARDRAIL_MASKED_ENTITY_COUNT] == 2
 
 
-def test_guardrail_success_span_is_ok():
+def test_guardrail_success_span_is_unset():
+    """On success the status is left UNSET (semconv default) — not forced OK."""
     engine, exporter = _engine()
     engine.emit(
         SpanRole.GUARDRAIL,
@@ -224,4 +226,4 @@ def test_guardrail_success_span_is_ok():
         ),
     )
     (span,) = exporter.get_finished_spans()
-    assert span.status.status_code is StatusCode.OK
+    assert span.status.status_code is StatusCode.UNSET

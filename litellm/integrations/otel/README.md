@@ -9,11 +9,13 @@ This package produces OpenTelemetry traces for LiteLLM. It is enabled by the
 A traced proxy request produces one trace with two kinds of spans:
 
 ```
-SERVER span  "POST /v1/chat/completions"      ← FastAPI instrumentation
-├── CLIENT span    "chat gpt-4o"               ← LLM call        ┐
-├── INTERNAL span  "execute_guardrail …"       ← guardrail       │ this package
-├── CLIENT span    "redis set"                 ← datastore call  │
-└── INTERNAL span  "router acompletion"        ← internal work   ┘
+SERVER span  "POST /v1/chat/completions"        ← FastAPI instrumentation
+├── INTERNAL span  "auth /v1/chat/completions"   ← auth phase     ┐
+│   ├── CLIENT span  "postgres get_key_object"    ← datastore call │
+│   └── CLIENT span  "postgres get_team_membership"                │
+├── INTERNAL span  "execute_guardrail …"         ← guardrail       │ this package
+├── CLIENT span    "chat gpt-4o"                  ← LLM call        │
+└── CLIENT span    "batch_write_to_db …"          ← spend write    ┘
 ```
 
 The gen-ai spans are siblings under the server span. In particular the guardrail
@@ -22,19 +24,38 @@ guardrail hooks are part of the request lifecycle (a pre-call guardrail runs
 before the LLM call even starts), so they parent to the server span via the
 ambient OpenTelemetry context, alongside the LLM call.
 
-Service calls split into two roles by their target. An outbound datastore call
-(redis, postgres) is a CLIENT `DB_CALL` span carrying `db.*` semconv; genuinely
-internal litellm work (router, budget/reset jobs, the pod-lock manager) is an
-INTERNAL `SERVICE` span. Both are named `"{service} {call_type}"` (e.g.
-`"redis set"`) so repeated calls to one service stay distinguishable. Like the
-LLM-call and guardrail spans, they parent to the **ambient** context — nesting
-under whatever request operation is active — and fall back to the server span
-the proxy threads as `litellm_parent_otel_span` only when ambient has no live
-span. A service call that fires outside any request (a background job) parents
-to neither and starts its own root trace instead of being dropped; the only
-calls that emit nothing are timing-less, parentless metrics pings (the
-per-request `self` latency hook, in-memory queue gauges) that exist solely to
-feed prometheus.
+**Which service calls become spans (`spans.span_role_for_service`).** LiteLLM's
+service-logging layer instruments many internal functions, but only some are
+traceable units of work:
+
+- **`DB_CALL` (CLIENT)** — outbound datastore calls (redis, postgres,
+  `batch_write_to_db`), carrying `db.system.name` / `db.operation.name` semconv.
+- **`SERVICE` (INTERNAL)** — genuine internal work worth a span (background
+  budget/reset jobs, pod-lock manager).
+- **metrics-only (no span)** — `self` (the `track_llm_api_timing` wrapper, which
+  duplicates the LLM-call span), `router` (duplicates the request), and
+  `proxy_pre_call` (a guardrail's real span is `execute_guardrail …`). These
+  still feed Prometheus/Datadog through their own hooks; they just never enter
+  the trace. `auth` is also excluded here because it gets a **live phase span**
+  instead (see below).
+
+Spans are named `"{service} {call_type}"` (e.g. `"redis set"`) so repeated calls
+to one service stay distinguishable. Like every other span they parent to the
+**ambient** context, falling back to the threaded `litellm_parent_otel_span` only
+when ambient has no live span; a background job with neither starts its own root
+trace. Caller-supplied `event_metadata` is **sanitized** before it reaches a span
+(primitives only, no live objects, no secrets/headers, bounded) — see
+`payloads.sanitize_event_metadata`.
+
+**Live phase spans.** `auth` is wrapped in a real, active span
+(`logger.phase_span`) for the duration of authentication, so the DB lookups it
+triggers nest **under** it instead of flattening onto the server span. Identity
+Baggage (team/key/user) is seeded once the key resolves, so every post-auth span
+inherits it; auth-internal DB lookups that run before the key is known stay
+unlabeled, which is correct.
+
+**Status.** On success a span's status is left `UNSET` (the semconv default,
+matching the FastAPI server span); only a genuine error sets `ERROR`.
 
 - **Server spans** (one per HTTP route) are created by the
   `opentelemetry-instrumentation-fastapi` package. It stamps `http.*` attributes

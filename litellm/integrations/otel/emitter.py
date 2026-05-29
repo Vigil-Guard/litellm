@@ -147,7 +147,9 @@ class SpanEmitter:
             span.set_status(
                 Status(StatusCode.ERROR, error.message or error.error_type or "error")
             )
-        else:
-            span.set_status(Status(StatusCode.OK))
+        # On success leave the status UNSET (the semconv default) rather than
+        # forcing OK — that matches the FastAPI server span and avoids implying a
+        # span-level health signal litellm doesn't actually evaluate. Only a
+        # genuine error sets a status.
         span.end(end_time=end_time_ns)
         return span

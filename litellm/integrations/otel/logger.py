@@ -16,12 +16,13 @@ server span active. Emission is therefore async-only — the sync callback runs
 in an out-of-context thread, where there is no parent span, so it is a no-op.
 """
 
+from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Mapping, cast
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, cast
 
 from opentelemetry.context import attach, get_current
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.trace import Span, Tracer, get_current_span
+from opentelemetry.trace import Span, Tracer, get_current_span, use_span
 
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -43,7 +44,7 @@ from litellm.integrations.otel.payloads import (
 )
 from litellm.integrations.otel.providers import build_tracer_provider, get_tracer
 from litellm.integrations.otel.routing import TenantTracerCache
-from litellm.integrations.otel.spans import SpanRole, service_kind
+from litellm.integrations.otel.spans import SpanRole, span_role_for_service
 from litellm.integrations.otel.utils import to_ns
 
 if TYPE_CHECKING:
@@ -293,12 +294,20 @@ class OpenTelemetryV2(CustomLogger):
         event_metadata: dict | None,
         error_override: str | None,
     ) -> Span | None:
-        # A success with neither timing nor a parent is a metrics-only ping — the
-        # per-request ``self`` latency hook and the in-memory queue gauges fire
-        # this way to feed prometheus, not to mark a traceable operation. A span
-        # for it would be a zero-duration root with no context, so skip it. Real
-        # background work (budget/reset jobs, spend flush) passes start/end times
-        # and still emits as a root; anything with a parent emits regardless.
+        data = ServiceSpanData.from_payload(payload, event_metadata=event_metadata)
+        # Decide whether this service call is a span at all, and of what kind.
+        # ``None`` means metrics-only (framework instrumentation that duplicates a
+        # gen-AI span — ``self``/``router``/``proxy_pre_call`` — or ``auth``, which
+        # gets a live phase span instead). Those still feed Prometheus/Datadog via
+        # their own hooks; they just never enter the trace.
+        role = span_role_for_service(data.service_name)
+        if role is None:
+            return None
+        # A metrics-only ping with neither timing nor a parent (in-memory queue
+        # gauges) is not a traceable operation; a span for it would be a
+        # zero-duration root with no context, so skip it. Real background work
+        # (budget/reset jobs, spend flush) passes start/end times and still emits
+        # as a root; anything with a parent emits regardless.
         if (
             error_override is None
             and start_time is None
@@ -306,7 +315,6 @@ class OpenTelemetryV2(CustomLogger):
             and parent_otel_span is None
         ):
             return None
-        data = ServiceSpanData.from_payload(payload, event_metadata=event_metadata)
         if error_override is not None and data.error is None:
             data = ServiceSpanData(
                 service_name=data.service_name,
@@ -314,15 +322,14 @@ class OpenTelemetryV2(CustomLogger):
                 error=SpanError(message=error_override),
                 event_metadata=data.event_metadata,
             )
-        # Parent like every other span: ambient context first (so the identity
-        # Baggage seeded in ``async_pre_call_hook`` rides along and the call nests
-        # under whatever request operation is active), falling back to the server
-        # span the proxy threaded as ``parent_otel_span``. A background service
-        # call has neither, so it starts its own root trace instead of being
-        # dropped. ``service_kind`` picks CLIENT (datastore) vs INTERNAL.
+        # Parent like every other span: ambient context first (so identity Baggage
+        # rides along and the call nests under whatever request phase is active —
+        # e.g. a DB lookup under the live ``auth`` span), falling back to the
+        # server span the proxy threaded as ``parent_otel_span``. A background
+        # service call has neither, so it starts its own root trace.
         parent_context = resolve_parent_context(threaded=parent_otel_span)
         return self._emitter.emit(
-            service_kind(data.service_name),
+            role,
             data,
             parent_context=parent_context,
             start_time_ns=to_ns(start_time),
@@ -334,28 +341,22 @@ class OpenTelemetryV2(CustomLogger):
     #  / errors are the FastAPI instrumentor's job, so we don't touch it here.
     # ====================================================================== #
 
-    async def async_pre_call_hook(
-        self,
-        user_api_key_dict: Any,
-        cache: Any,
-        data: dict,
-        call_type: Any,
-    ) -> dict:
-        """Seed request identity into Baggage at the start of the request.
+    def seed_request_identity(self, user_api_key_dict: Any, model: Any = None) -> None:
+        """Attach request-identity Baggage to the current context + server span.
 
-        This runs in the request task (the server span is the ambient context),
-        so attaching the identity Baggage here makes **every** span emitted for
-        the request — LLM call, guardrail, and service — inherit it via
-        ``LiteLLMBaggageSpanProcessor``. Without this, only the LLM-call span got
-        identity (it promoted Baggage locally) and the guardrail/service spans,
-        which parent to the server span, had none. The async logging worker
-        copies this context at enqueue time, so the LLM-call span inherits it too.
+        Seeding identity into Baggage makes **every** span emitted afterwards for
+        this request — LLM call, guardrail, DB call — inherit it via
+        ``LiteLLMBaggageSpanProcessor``. Called once at the auth boundary (as soon
+        as the key resolves) so post-auth spans are labeled consistently; the
+        Baggage rides the request task's contextvar from there on. Auth-internal
+        DB lookups that run before the key is known stay unlabeled — identity
+        isn't determined yet, which is correct.
         """
         try:
             identity = RequestIdentity.from_user_api_key_auth(user_api_key_dict)
             bag = promoted_baggage(
                 identity,
-                data.get("model") if isinstance(data, dict) else None,
+                model,
                 promoted_keys=tuple(self.config.baggage_promoted_keys),
                 metadata_keys=tuple(self.config.baggage_metadata_keys),
             )
@@ -363,15 +364,47 @@ class OpenTelemetryV2(CustomLogger):
                 # Attach (no detach): the contextvar is scoped to this request's
                 # asyncio task and is reclaimed when the task ends.
                 attach(set_request_baggage(bag, context=get_current()))
-                # The server span was started by the instrumentor before this
-                # hook ran, so the Baggage processor (which only fires at span
-                # start) won't backfill it — stamp identity on it directly.
+                # The server span was started by the instrumentor before this ran,
+                # so the Baggage processor (which only fires at span start) won't
+                # backfill it — stamp identity on it directly.
                 server_span = get_current_span()
                 if is_recordable_span(server_span):
                     for key, value in bag.items():
                         server_span.set_attribute(key, value)
         except Exception:
             pass
+
+    @contextmanager
+    def start_phase_span(self, name: str) -> "Iterator[Span]":
+        """Open a live, **active** INTERNAL span for a request phase (e.g. auth).
+
+        Unlike the post-hoc service spans (emitted from start/end timestamps after
+        the fact), this span is the active OTel context for the duration of the
+        ``with`` block. Service/DB calls fired inside it — even via
+        ``asyncio.create_task``, which copies the active context — therefore nest
+        under it instead of flattening onto the server span.
+        """
+        span = self._emitter.start_span(SpanRole.SERVICE, name)
+        with use_span(span, end_on_exit=True):
+            yield span
+
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: Any,
+        cache: Any,
+        data: dict,
+        call_type: Any,
+    ) -> dict:
+        """Re-seed identity Baggage in the request task.
+
+        Identity is first seeded at the auth boundary (``seed_request_identity``),
+        but this hook re-seeds with the request ``model`` now known and covers
+        entrypoints that don't pass through that boundary (e.g. the SDK). Idempotent.
+        """
+        self.seed_request_identity(
+            user_api_key_dict,
+            model=data.get("model") if isinstance(data, dict) else None,
+        )
         return data
 
     async def async_post_call_success_hook(
@@ -472,3 +505,43 @@ class OpenTelemetryV2(CustomLogger):
     @staticmethod
     def set_preprocessing_duration_attribute(span: Span | None, container: Any) -> None:
         """No-op: the server span belongs to the FastAPI instrumentor."""
+
+
+# ====================================================================== #
+#  Module-level seam for proxy-core call sites (auth, …). These resolve the
+#  registered V2 logger and no-op when V2 is not the active logger, so the
+#  proxy can call them unconditionally without importing the OTel SDK or
+#  knowing whether V2 is enabled.
+# ====================================================================== #
+
+
+def _registered_v2_logger() -> "OpenTelemetryV2 | None":
+    """The proxy's registered logger if it is the V2 ``OpenTelemetryV2``, else None."""
+    try:
+        from litellm.proxy import proxy_server
+    except Exception:
+        return None
+    logger = getattr(proxy_server, "open_telemetry_logger", None)
+    return logger if isinstance(logger, OpenTelemetryV2) else None
+
+
+def seed_request_identity(user_api_key_dict: Any, model: Any = None) -> None:
+    """Seed request-identity Baggage at the auth boundary (no-op without V2)."""
+    logger = _registered_v2_logger()
+    if logger is not None:
+        logger.seed_request_identity(user_api_key_dict, model=model)
+
+
+@contextmanager
+def phase_span(name: str) -> "Iterator[Span | None]":
+    """Run a request phase inside a live active span so its DB/service calls nest.
+
+    A no-op (yields ``None``) when V2 is not the active logger, so proxy-core
+    call sites can wrap a phase unconditionally.
+    """
+    logger = _registered_v2_logger()
+    if logger is None:
+        yield None
+        return
+    with logger.start_phase_span(name) as span:
+        yield span

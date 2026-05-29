@@ -53,7 +53,7 @@ from litellm.integrations.otel.spans import (
     SpanRole,
     SpanSpec,
     db_system,
-    service_kind,
+    span_role_for_service,
     validate_registry,
 )
 
@@ -82,7 +82,7 @@ __all__ = [
     "SpanRole",
     "SpanSpec",
     "db_system",
-    "service_kind",
+    "span_role_for_service",
     "validate_registry",
     # payloads
     "GuardrailSpanData",
