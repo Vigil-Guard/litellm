@@ -193,7 +193,12 @@ class ServiceLogging(CustomLogger):
                 )
             else:
                 _otel_logger_to_use = self._resolve_otel_service_logger(callback)
-                if _otel_logger_to_use is not None and parent_otel_span is not None:
+                # No ``parent_otel_span is not None`` gate: a background service
+                # call (no request on the stack) has no parent, and dropping it
+                # here is what hid those calls from traces entirely. The OTel
+                # logger decides what to do with a missing parent — legacy V1
+                # no-ops, V2 emits a root span (and skips metrics-only pings).
+                if _otel_logger_to_use is not None:
                     await _otel_logger_to_use.async_service_success_hook(
                         payload=payload,
                         parent_otel_span=parent_otel_span,
@@ -298,7 +303,9 @@ class ServiceLogging(CustomLogger):
                 if not isinstance(error, str):
                     error = str(error)
 
-                if _otel_logger_to_use is not None and parent_otel_span is not None:
+                # See the success hook: no parent gate, so background failures
+                # are traced too. V1 no-ops without a parent; V2 emits a root.
+                if _otel_logger_to_use is not None:
                     await _otel_logger_to_use.async_service_failure_hook(
                         payload=payload,
                         error=error,

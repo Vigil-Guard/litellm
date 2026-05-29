@@ -141,6 +141,9 @@ def test_name_builders():
         proxy_request_span_name(ProxyRequestSpanData("POST", "/chat/completions"))
         == "POST /chat/completions"
     )
+    # "{service} {call_type}" so same-service calls stay distinguishable; the
+    # service name alone when there's no call type.
+    assert service_span_name(ServiceSpanData("redis", call_type="set")) == "redis set"
     assert service_span_name(ServiceSpanData("redis")) == "redis"
     assert (
         guardrail_span_name(GuardrailSpanData("presidio"))
@@ -224,9 +227,17 @@ def test_genai_mapper_guardrail_and_service():
     assert g[LiteLLM.GUARDRAIL_NAME] == "presidio"
     assert g[LiteLLM.GUARDRAIL_MODE] == "pre"
 
+    # A datastore service (redis) also gets db.* semconv.
     s = GenAIMapper().map(ServiceSpanData("redis", call_type="set"))
     assert s[LiteLLM.SERVICE_NAME] == "redis"
     assert s[LiteLLM.SERVICE_CALL_TYPE] == "set"
+    assert s["db.system.name"] == "redis"
+    assert s["db.operation.name"] == "set"
+
+    # An internal service (router) gets no db.* keys.
+    internal = GenAIMapper().map(ServiceSpanData("router", call_type="acompletion"))
+    assert internal[LiteLLM.SERVICE_NAME] == "router"
+    assert "db.system.name" not in internal
 
 
 def test_legacy_mapper_all_request_params():

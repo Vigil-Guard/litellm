@@ -17,7 +17,8 @@ from litellm.integrations.otel.payloads import (
     ServiceSpanData,
     ToolDefinition,
 )
-from litellm.integrations.otel.semconv import Error, GenAI, LiteLLM, Server
+from litellm.integrations.otel.semconv import DB, Error, GenAI, LiteLLM, Server
+from litellm.integrations.otel.spans import db_system
 
 
 class GenAIMapper:
@@ -115,6 +116,14 @@ class GenAIMapper:
     @classmethod
     def _service(cls, data: ServiceSpanData) -> AttributeMap:
         attrs = collect(cls._SERVICE_ATTRS, data)
+        # An outbound datastore call (DB_CALL / CLIENT span) also carries db.*
+        # semconv. Internal services (router, budget jobs, …) have no db.system,
+        # so they get only the litellm.service.* keys above.
+        system = db_system(data.service_name)
+        if system is not None:
+            attrs[DB.SYSTEM_NAME] = system
+            if data.call_type:
+                attrs[DB.OPERATION_NAME] = data.call_type
         attrs.update(
             {
                 f"{LiteLLM.METADATA_PREFIX}{key}": value

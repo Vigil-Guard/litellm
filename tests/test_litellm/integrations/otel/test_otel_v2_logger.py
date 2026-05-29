@@ -277,7 +277,7 @@ def test_pre_call_hook_seeds_baggage_onto_server_and_child_spans():
     server.end()
 
     spans = {s.name: s for s in exporter.get_finished_spans()}
-    redis = spans["redis"]
+    redis = spans["redis set"]
     assert redis.attributes[LiteLLM.TEAM_ID] == "t1"
     assert redis.attributes[LiteLLM.KEY_HASH] == "hash1"
     assert redis.attributes[f"{LiteLLM.METADATA_PREFIX}user_api_key_user_id"] == "u1"
@@ -328,8 +328,12 @@ def test_async_service_success_hook_emits_service_span():
     finally:
         parent.end()
     by_name = {s.name: s for s in exporter.get_finished_spans()}
-    span = by_name["redis"]
-    assert span.kind is SpanKind.INTERNAL
+    # Name disambiguates calls to the same service; redis is an outbound
+    # datastore call, so it's a CLIENT span with db.* semconv.
+    span = by_name["redis set"]
+    assert span.kind is SpanKind.CLIENT
+    assert span.attributes["db.system.name"] == "redis"
+    assert span.attributes["db.operation.name"] == "set"
     assert span.attributes[LiteLLM.SERVICE_NAME] == "redis"
     assert span.attributes[LiteLLM.SERVICE_CALL_TYPE] == "set"
     # Canonical (V2) namespaced metadata key
@@ -355,7 +359,9 @@ def test_async_service_failure_hook_marks_error_status():
     finally:
         parent.end()
     by_name = {s.name: s for s in exporter.get_finished_spans()}
-    span = by_name["postgres"]
+    span = by_name["postgres query"]
+    assert span.kind is SpanKind.CLIENT
+    assert span.attributes["db.system.name"] == "postgresql"
     assert span.status.status_code is StatusCode.ERROR
     # Without an explicit error_type from the payload, V2 stamps the fallback.
     assert span.attributes["error.type"] == "error"
@@ -377,13 +383,15 @@ def test_async_service_failure_hook_preserves_payload_error_over_override():
     finally:
         parent.end()
     by_name = {s.name: s for s in exporter.get_finished_spans()}
-    span = by_name["postgres"]
+    span = by_name["postgres query"]
     assert span.status.status_code is StatusCode.ERROR
     assert "db-down" in (span.status.description or "")
 
 
-def test_service_hook_without_parent_is_noop():
-    """Mirrors V1: no parent OTel span → no service span (no free-standing roots)."""
+def test_metrics_only_ping_without_timing_or_parent_is_noop():
+    """A success with no timing and no parent is a prometheus-only ping (the
+    per-request ``self`` latency hook, in-memory queue gauges) — not a traceable
+    operation, so no span is emitted."""
     logger, exporter = _logger()
     asyncio.run(
         logger.async_service_success_hook(
@@ -391,6 +399,43 @@ def test_service_hook_without_parent_is_noop():
         )
     )
     assert exporter.get_finished_spans() == ()
+
+
+def test_background_service_call_with_timing_emits_root_span():
+    """A background datastore call (no request → no parent) but with real timing
+    still emits — as its own root trace — instead of being dropped."""
+    logger, exporter = _logger()
+    asyncio.run(
+        logger.async_service_success_hook(
+            payload=_ServicePayload("postgres", "query"),
+            parent_otel_span=None,
+            start_time=1.0,
+            end_time=2.0,
+        )
+    )
+    spans = exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["postgres query"]
+    # No parent → it's a root span of its own trace.
+    assert spans[0].parent is None
+    assert spans[0].kind is SpanKind.CLIENT
+
+
+def test_internal_service_call_is_internal_kind_without_db_attrs():
+    """A genuinely internal service (router) is an INTERNAL span with no db.*."""
+    logger, exporter = _logger()
+    asyncio.run(
+        logger.async_service_success_hook(
+            payload=_ServicePayload("router", "acompletion"),
+            parent_otel_span=None,
+            start_time=1.0,
+            end_time=2.0,
+        )
+    )
+    span = exporter.get_finished_spans()[0]
+    assert span.name == "router acompletion"
+    assert span.kind is SpanKind.INTERNAL
+    assert "db.system.name" not in span.attributes
+    assert span.attributes[LiteLLM.SERVICE_NAME] == "router"
 
 
 def test_service_span_inherits_parent_when_provided():
@@ -408,9 +453,33 @@ def test_service_span_inherits_parent_when_provided():
         parent.end()
     by_name = {s.name: s for s in exporter.get_finished_spans()}
     assert (
-        by_name["redis"].parent.span_id
+        by_name["redis set"].parent.span_id
         == by_name[LITELLM_PROXY_REQUEST_SPAN_NAME].get_span_context().span_id
     )
+
+
+def test_service_span_prefers_ambient_context_over_threaded_parent():
+    """Service spans parent to the active (ambient) span when there is one, not
+    the threaded ``parent_otel_span`` — matching the LLM-call/guardrail spans.
+    The threaded span is only a fallback for when ambient has no live span."""
+    logger, exporter = _logger()
+    ambient = logger._emitter.start_span(SpanRole.LLM_CALL, "chat gpt-4o")
+    threaded = logger._emitter.start_span(
+        SpanRole.PROXY_REQUEST, LITELLM_PROXY_REQUEST_SPAN_NAME
+    )
+    try:
+        with trace.use_span(ambient, end_on_exit=False):
+            asyncio.run(
+                logger.async_service_success_hook(
+                    payload=_ServicePayload("redis", "get"),
+                    parent_otel_span=threaded,
+                )
+            )
+    finally:
+        ambient.end()
+        threaded.end()
+    by_name = {s.name: s for s in exporter.get_finished_spans()}
+    assert by_name["redis get"].parent.span_id == ambient.get_span_context().span_id
 
 
 # --------------------------------------------------------------------------- #

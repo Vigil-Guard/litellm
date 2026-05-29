@@ -4,7 +4,7 @@ from typing import Mapping
 
 from opentelemetry import baggage
 from opentelemetry.context import Context, get_current
-from opentelemetry.trace import Span, set_span_in_context
+from opentelemetry.trace import Span, get_current_span, set_span_in_context
 from opentelemetry.trace.propagation.tracecontext import (
     TraceContextTextMapPropagator,
 )
@@ -30,6 +30,24 @@ def get_baggage_attributes(context: Context | None = None) -> dict[str, str]:
 def context_from_span(span: Span, context: Context | None = None) -> Context:
     """A context with ``span`` as the active span (for explicit parenting)."""
     return set_span_in_context(span, context=context)
+
+
+def resolve_parent_context(threaded: Span | None = None) -> Context:
+    """The context a child span should parent under: ambient first, then threaded.
+
+    Every gen-ai span parents to the ambient OTel context (the active server
+    span, restored by the logging worker or active in the request task). But that
+    context can lose the server span — e.g. logging dispatched from a detached
+    ``asyncio.create_task``, or a background service call with no request on the
+    stack. In that case fall back to the span the proxy threaded explicitly
+    (``litellm_parent_otel_span``) so the child still nests under the request
+    instead of being dropped. When neither is recordable the ambient context is
+    returned unchanged, so the span simply starts a new root trace.
+    """
+    ctx = get_current()
+    if not is_recordable_span(get_current_span(ctx)) and is_recordable_span(threaded):
+        ctx = context_from_span(threaded, context=ctx)  # type: ignore[arg-type]
+    return ctx
 
 
 def is_recordable_span(obj: object) -> bool:

@@ -84,6 +84,17 @@ class Server:
     PORT: Final = "server.port"
 
 
+class DB:
+    """Database / cache client-span keys (OTel ``db.*`` semconv).
+
+    Stamped on ``DB_CALL`` spans (redis / postgres), which are CLIENT spans for
+    outbound datastore calls — not on the INTERNAL ``SERVICE`` spans.
+    """
+
+    SYSTEM_NAME: Final = "db.system.name"
+    OPERATION_NAME: Final = "db.operation.name"
+
+
 class HTTP:
     """HTTP server-span keys. Belong on the SERVER span only (never promoted)."""
 

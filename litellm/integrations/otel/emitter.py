@@ -31,6 +31,9 @@ from litellm.integrations.otel.spans import (
 _NAME_BUILDERS: dict[SpanRole, Callable[..., str]] = {
     SpanRole.LLM_CALL: llm_call_span_name,
     SpanRole.GUARDRAIL: guardrail_span_name,
+    # DB_CALL and SERVICE are both built from ServiceSpanData; they differ only in
+    # span kind (CLIENT vs INTERNAL) and attribute vocabulary, not in naming.
+    SpanRole.DB_CALL: service_span_name,
     SpanRole.SERVICE: service_span_name,
 }
 

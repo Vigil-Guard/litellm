@@ -35,6 +35,7 @@ from litellm.integrations.otel.payloads import (
     SpanError,
 )
 from litellm.integrations.otel.semconv import (
+    DB,
     Error,
     GenAI,
     GenAIOperation,
@@ -51,6 +52,8 @@ from litellm.integrations.otel.spans import (
     LiteLLMSpanKind,
     SpanRole,
     SpanSpec,
+    db_system,
+    service_kind,
     validate_registry,
 )
 
@@ -61,6 +64,7 @@ __all__ = [
     "is_otel_v2_enabled",
     # semconv
     "BAGGAGE_PROMOTED_KEYS",
+    "DB",
     "DEFAULT_BAGGAGE_METADATA_KEYS",
     "Error",
     "GenAI",
@@ -77,6 +81,8 @@ __all__ = [
     "LiteLLMSpanKind",
     "SpanRole",
     "SpanSpec",
+    "db_system",
+    "service_kind",
     "validate_registry",
     # payloads
     "GuardrailSpanData",

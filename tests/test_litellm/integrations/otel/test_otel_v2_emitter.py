@@ -127,18 +127,25 @@ def test_hierarchy_and_kinds_match_registry():
     engine.emit(
         SpanRole.GUARDRAIL, GuardrailSpanData("presidio", status="success"), root_ctx
     )
-    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis", call_type="set"), root_ctx)
+    # An outbound datastore call (DB_CALL) and an internal service call differ in
+    # span kind; both are named "{service} {call_type}".
+    engine.emit(SpanRole.DB_CALL, ServiceSpanData("redis", call_type="set"), root_ctx)
+    engine.emit(
+        SpanRole.SERVICE, ServiceSpanData("router", call_type="acompletion"), root_ctx
+    )
     root.end()
 
     by_name = {s.name: s for s in exporter.get_finished_spans()}
     root_id = root.get_span_context().span_id
     assert by_name["chat gpt-4o"].parent.span_id == root_id
     assert by_name["execute_guardrail presidio"].parent.span_id == root_id
-    assert by_name["redis"].parent.span_id == root_id
+    assert by_name["redis set"].parent.span_id == root_id
+    assert by_name["router acompletion"].parent.span_id == root_id
     # kinds come straight from the registry
     assert by_name["chat gpt-4o"].kind is SpanKind.CLIENT
     assert by_name["execute_guardrail presidio"].kind is SpanKind.INTERNAL
-    assert by_name["redis"].kind is SpanKind.INTERNAL
+    assert by_name["redis set"].kind is SpanKind.CLIENT
+    assert by_name["router acompletion"].kind is SpanKind.INTERNAL
     assert by_name["POST /chat/completions"].kind is SpanKind.SERVER
 
 

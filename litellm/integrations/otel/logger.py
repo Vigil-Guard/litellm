@@ -28,8 +28,8 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.otel.baggage import promoted_baggage
 from litellm.integrations.otel.config import OpenTelemetryV2Config
 from litellm.integrations.otel.context import (
-    context_from_span,
     is_recordable_span,
+    resolve_parent_context,
     set_request_baggage,
 )
 from litellm.integrations.otel.emitter import SpanEmitter
@@ -43,7 +43,7 @@ from litellm.integrations.otel.payloads import (
 )
 from litellm.integrations.otel.providers import build_tracer_provider, get_tracer
 from litellm.integrations.otel.routing import TenantTracerCache
-from litellm.integrations.otel.spans import SpanRole
+from litellm.integrations.otel.spans import SpanRole, service_kind
 from litellm.integrations.otel.utils import to_ns
 
 if TYPE_CHECKING:
@@ -222,13 +222,7 @@ class OpenTelemetryV2(CustomLogger):
         # server span — e.g. pass-through logging fired from a detached task —
         # fall back to the server span the proxy threaded through metadata so the
         # call span still nests under the request instead of being dropped.
-        parent_ctx = get_current()
-        if not is_recordable_span(get_current_span(parent_ctx)):
-            threaded_parent = _threaded_parent_span(kwargs)
-            if is_recordable_span(threaded_parent):
-                parent_ctx = context_from_span(
-                    cast("Span", threaded_parent), context=parent_ctx
-                )
+        parent_ctx = resolve_parent_context(threaded=_threaded_parent_span(kwargs))
         # Write identity into Baggage so child spans (guardrails, services)
         # inherit it.
         bag = promoted_baggage(
@@ -299,7 +293,18 @@ class OpenTelemetryV2(CustomLogger):
         event_metadata: dict | None,
         error_override: str | None,
     ) -> Span | None:
-        if not is_recordable_span(parent_otel_span):
+        # A success with neither timing nor a parent is a metrics-only ping — the
+        # per-request ``self`` latency hook and the in-memory queue gauges fire
+        # this way to feed prometheus, not to mark a traceable operation. A span
+        # for it would be a zero-duration root with no context, so skip it. Real
+        # background work (budget/reset jobs, spend flush) passes start/end times
+        # and still emits as a root; anything with a parent emits regardless.
+        if (
+            error_override is None
+            and start_time is None
+            and end_time is None
+            and parent_otel_span is None
+        ):
             return None
         data = ServiceSpanData.from_payload(payload, event_metadata=event_metadata)
         if error_override is not None and data.error is None:
@@ -309,14 +314,15 @@ class OpenTelemetryV2(CustomLogger):
                 error=SpanError(message=error_override),
                 event_metadata=data.event_metadata,
             )
-        # Parent to the server span, but layer it over the ambient context so the
-        # identity Baggage seeded in ``async_pre_call_hook`` rides along and the
-        # service span gets the same identity attributes as the LLM-call span.
-        parent_context = context_from_span(
-            cast(Span, parent_otel_span), context=get_current()
-        )
+        # Parent like every other span: ambient context first (so the identity
+        # Baggage seeded in ``async_pre_call_hook`` rides along and the call nests
+        # under whatever request operation is active), falling back to the server
+        # span the proxy threaded as ``parent_otel_span``. A background service
+        # call has neither, so it starts its own root trace instead of being
+        # dropped. ``service_kind`` picks CLIENT (datastore) vs INTERNAL.
+        parent_context = resolve_parent_context(threaded=parent_otel_span)
         return self._emitter.emit(
-            SpanRole.SERVICE,
+            service_kind(data.service_name),
             data,
             parent_context=parent_context,
             start_time_ns=to_ns(start_time),

@@ -12,7 +12,8 @@ A traced proxy request produces one trace with two kinds of spans:
 SERVER span  "POST /v1/chat/completions"      ← FastAPI instrumentation
 ├── CLIENT span    "chat gpt-4o"               ← LLM call        ┐
 ├── INTERNAL span  "execute_guardrail …"       ← guardrail       │ this package
-└── INTERNAL span  "redis" …                   ← service call    ┘
+├── CLIENT span    "redis set"                 ← datastore call  │
+└── INTERNAL span  "router acompletion"        ← internal work   ┘
 ```
 
 The gen-ai spans are siblings under the server span. In particular the guardrail
@@ -20,6 +21,20 @@ span is a sibling of the LLM call, not a child of it: pre/during/post-call
 guardrail hooks are part of the request lifecycle (a pre-call guardrail runs
 before the LLM call even starts), so they parent to the server span via the
 ambient OpenTelemetry context, alongside the LLM call.
+
+Service calls split into two roles by their target. An outbound datastore call
+(redis, postgres) is a CLIENT `DB_CALL` span carrying `db.*` semconv; genuinely
+internal litellm work (router, budget/reset jobs, the pod-lock manager) is an
+INTERNAL `SERVICE` span. Both are named `"{service} {call_type}"` (e.g.
+`"redis set"`) so repeated calls to one service stay distinguishable. Like the
+LLM-call and guardrail spans, they parent to the **ambient** context — nesting
+under whatever request operation is active — and fall back to the server span
+the proxy threads as `litellm_parent_otel_span` only when ambient has no live
+span. A service call that fires outside any request (a background job) parents
+to neither and starts its own root trace instead of being dropped; the only
+calls that emit nothing are timing-less, parentless metrics pings (the
+per-request `self` latency hook, in-memory queue gauges) that exist solely to
+feed prometheus.
 
 - **Server spans** (one per HTTP route) are created by the
   `opentelemetry-instrumentation-fastapi` package. It stamps `http.*` attributes
@@ -73,9 +88,13 @@ becomes the global, so server spans export to that backend too.
    service spans the same way — typed data → engine → span. Service spans
    (Redis/Postgres) are dispatched by `litellm/_service_logger.py`, which
    recognizes the V2 `OpenTelemetryV2` logger (a plain `CustomLogger`, not a
-   subclass of the legacy `OpenTelemetry`). Guardrail span data is built from the
-   typed, provider-agnostic `StandardLoggingGuardrailInformation` — no single
-   provider's field shape is assumed.
+   subclass of the legacy `OpenTelemetry`). It hands every service call to the
+   logger — including calls with no parent span — and the V2 adapter decides the
+   role (`DB_CALL` vs `SERVICE`), the parent (ambient → threaded → root), and
+   whether the call is a traceable operation or a metrics-only ping. Guardrail
+   span data is built from the typed, provider-agnostic
+   `StandardLoggingGuardrailInformation` — no single provider's field shape is
+   assumed.
 6. **Export**: each span ends and is handed to the provider's span processors,
    which export to the configured backends (OTLP, console, in-memory, …).
 

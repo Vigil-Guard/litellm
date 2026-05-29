@@ -8,13 +8,24 @@ Canonical hierarchy::
     PROXY_REQUEST  (SERVER, root)   # owned by the FastAPI instrumentor
     ├── LLM_CALL   (CLIENT)
     ├── GUARDRAIL  (INTERNAL)   # request-lifecycle hook, sibling of LLM_CALL
-    └── SERVICE    (INTERNAL)
+    ├── DB_CALL    (CLIENT)     # outbound datastore call (redis/postgres)
+    └── SERVICE    (INTERNAL)   # litellm-internal work (router, budget jobs, …)
 
 Guardrails parent to PROXY_REQUEST, not LLM_CALL: pre/during/post-call guardrail
 hooks are orchestrated by the request lifecycle (a pre-call guardrail runs
 before the LLM call even starts), so a guardrail is a sibling of the LLM call,
 not a child of it. The emitter parents every span to the ambient OTel context
 (the active server span), which matches this.
+
+Service calls are split into two roles by :func:`service_kind`. An outbound call
+to an external datastore (redis, postgres) is a ``DB_CALL`` — a CLIENT span that
+carries ``db.*`` semconv attributes. Genuinely internal litellm operations
+(``self``, ``router``, budget/reset jobs, the pod-lock manager, in-memory
+queues) are ``SERVICE`` — INTERNAL spans. Both are built from the same
+``ServiceSpanData``; only the role (hence span kind and attribute vocabulary)
+differs. Unlike the LLM-call and guardrail spans, a service call can fire
+outside any request (a background job), in which case it parents to no server
+span and starts its own root trace rather than being dropped.
 
 Management/admin endpoints are ordinary FastAPI routes — their SERVER spans are
 owned by the instrumentor too, so they don't appear as a role here.
@@ -37,6 +48,7 @@ class SpanRole(str, Enum):
     PROXY_REQUEST = "proxy_request"
     LLM_CALL = "llm_call"
     GUARDRAIL = "guardrail"
+    DB_CALL = "db_call"
     SERVICE = "service"
 
 
@@ -65,10 +77,43 @@ SPAN_REGISTRY: dict[SpanRole, SpanSpec] = {
     SpanRole.GUARDRAIL: SpanSpec(
         SpanRole.GUARDRAIL, LiteLLMSpanKind.INTERNAL, parent=SpanRole.PROXY_REQUEST
     ),
+    SpanRole.DB_CALL: SpanSpec(
+        SpanRole.DB_CALL, LiteLLMSpanKind.CLIENT, parent=SpanRole.PROXY_REQUEST
+    ),
     SpanRole.SERVICE: SpanSpec(
         SpanRole.SERVICE, LiteLLMSpanKind.INTERNAL, parent=SpanRole.PROXY_REQUEST
     ),
 }
+
+
+# ``ServiceTypes`` value -> ``db.system.name``. These are outbound datastore
+# calls and become CLIENT ``DB_CALL`` spans; ``redis_``-prefixed names cover the
+# redis-backed spend queues. Any service not mapped here is litellm-internal work
+# and stays an INTERNAL ``SERVICE`` span. This table is the single source of
+# datastore knowledge — both the role classifier and the mapper read it.
+_DB_SYSTEM_BY_SERVICE: dict[str, str] = {
+    "redis": "redis",
+    "postgres": "postgresql",
+    "batch_write_to_db": "postgresql",
+}
+
+
+def db_system(service_name: str) -> str | None:
+    """The ``db.system.name`` for a datastore service, else ``None``.
+
+    ``None`` means the service is not an outbound datastore call. Redis-backed
+    spend queues (``redis_*``) map to ``redis``.
+    """
+    if service_name in _DB_SYSTEM_BY_SERVICE:
+        return _DB_SYSTEM_BY_SERVICE[service_name]
+    if service_name.startswith("redis_"):
+        return "redis"
+    return None
+
+
+def service_kind(service_name: str) -> SpanRole:
+    """Role for a service call: ``DB_CALL`` for datastores, else ``SERVICE``."""
+    return SpanRole.DB_CALL if db_system(service_name) is not None else SpanRole.SERVICE
 
 
 # --- span name builders (the naming convention, per role) ------------------- #
@@ -90,7 +135,9 @@ def guardrail_span_name(data: "GuardrailSpanData") -> str:
 
 
 def service_span_name(data: "ServiceSpanData") -> str:
-    return data.service_name
+    """``"{service} {call_type}"`` e.g. ``"redis set"`` — service name alone when
+    no call type is known, so identically-named calls stay distinguishable."""
+    return f"{data.service_name} {data.call_type or ''}".strip()
 
 
 def root_roles() -> list[SpanRole]:

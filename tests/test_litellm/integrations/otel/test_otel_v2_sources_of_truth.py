@@ -5,6 +5,7 @@ import pytest
 
 from litellm.integrations.otel import (
     BAGGAGE_PROMOTED_KEYS,
+    DB,
     Error,
     GenAI,
     GenAIOperation,
@@ -92,11 +93,15 @@ def test_registry_hierarchy_shape():
     assert set(child_roles(SpanRole.PROXY_REQUEST)) == {
         SpanRole.LLM_CALL,
         SpanRole.GUARDRAIL,
+        SpanRole.DB_CALL,
         SpanRole.SERVICE,
     }
     assert SPAN_REGISTRY[SpanRole.LLM_CALL].kind is LiteLLMSpanKind.CLIENT
     assert SPAN_REGISTRY[SpanRole.PROXY_REQUEST].kind is LiteLLMSpanKind.SERVER
     assert SPAN_REGISTRY[SpanRole.GUARDRAIL].parent is SpanRole.PROXY_REQUEST
+    # An outbound datastore call is a CLIENT span; an internal service is INTERNAL.
+    assert SPAN_REGISTRY[SpanRole.DB_CALL].kind is LiteLLMSpanKind.CLIENT
+    assert SPAN_REGISTRY[SpanRole.SERVICE].kind is LiteLLMSpanKind.INTERNAL
 
 
 def test_llm_call_span_name():
@@ -118,7 +123,7 @@ def _all_constants(cls):
 def test_attribute_keys_are_unique_across_namespaces():
     # prefixes are allowed to be substrings; exact keys must not collide.
     exact = set()
-    for cls in (GenAI, Error, Server, HTTP):
+    for cls in (GenAI, Error, Server, HTTP, DB):
         for key in _all_constants(cls):
             assert key not in exact, f"duplicate attribute key {key}"
             exact.add(key)
