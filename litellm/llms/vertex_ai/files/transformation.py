@@ -208,7 +208,7 @@ def _iter_openai_jsonl_lines(openai_file_content: FileTypes) -> Iterator[str]:
                 chunk, start = content[start:], length
             else:
                 chunk, start = content[start:idx], idx + 1
-            line = bytes(chunk).decode("utf-8").strip()
+            line = chunk.decode("utf-8").strip()
             if line:
                 yield line
         return
@@ -256,21 +256,32 @@ def _stream_openai_jsonl_to_vertex(
     httpx ships it without a str->bytes re-encode, str for the legacy GCS log
     path) and the first parsed OpenAI entry so callers can derive the GCS object
     name without re-parsing the payload.
+
+    The bytes path extends a single ``bytearray`` in place rather than collecting
+    a list of encoded lines and joining: the join would hold both the list and
+    the joined result at once, doubling peak output memory on a ~1 GB upload.
     """
     first_entry: Optional[Dict[str, Any]] = None
-    parts: List[Any] = []
+    byte_buf = bytearray()
+    str_parts: List[str] = []
     for entry in _iter_openai_jsonl_entries(openai_file_content):
         if first_entry is None:
             first_entry = entry
-        vertex_request = _openai_batch_jsonl_entry_to_vertex_wrapped_request(
-            entry, map_openai_to_vertex_params
+        line = json.dumps(
+            _openai_batch_jsonl_entry_to_vertex_wrapped_request(
+                entry, map_openai_to_vertex_params
+            )
         )
-        line = json.dumps(vertex_request)
-        parts.append(line.encode("utf-8") if as_bytes else line)
+        if as_bytes:
+            if byte_buf:
+                byte_buf.extend(b"\n")
+            byte_buf.extend(line.encode("utf-8"))
+        else:
+            str_parts.append(line)
 
     if as_bytes:
-        return b"\n".join(parts), first_entry
-    return "\n".join(parts), first_entry
+        return bytes(byte_buf), first_entry
+    return "\n".join(str_parts), first_entry
 
 
 class VertexAIFilesConfig(VertexBase, BaseFilesConfig):

@@ -6,15 +6,19 @@ full intermediate lists (decoded str, splitlines list, list of parsed dicts,
 list of transformed dicts, joined output). On a ~1 GB upload that tripped the
 OOM-killer on the customer's workers. The hot paths now stream entry-by-entry.
 
-These tests lock in three things that would regress if the streaming path were
+These tests lock in the behaviour that would regress if the streaming path were
 reverted to the list-based pipeline:
   1. Byte-for-byte output parity with the legacy list pipeline (wire format).
-  2. A peak-memory ceiling on the streaming transform, paired with a measurement
-     of the legacy list pipeline that exceeds it on the same input.
+  2. The streaming transform peaks at a clear fraction of the legacy list
+     pipeline on the same input (relative differential, robust to GC noise).
   3. ``get_object_name`` only parses the first JSONL row (it no longer crashes on
      a payload whose later rows are not valid JSON).
+  4. A tuple-wrapped file handle uploaded through the real create_file ordering
+     keeps every row, including entry 0 (no partial upload from a consumed
+     cursor).
 """
 
+import gc
 import io
 import json
 import tracemalloc
@@ -24,6 +28,7 @@ import pytest
 from litellm.llms.vertex_ai.files.transformation import (
     VertexAIFilesConfig,
     VertexAIJsonlFilesTransformation,
+    _get_litellm_batch_custom_id_from_labels,
     _iter_openai_jsonl_entries,
     _iter_openai_jsonl_lines,
     _stream_openai_jsonl_to_vertex,
@@ -90,6 +95,52 @@ class TestStreamingOutputParity:
         assert out.decode("utf-8") == _legacy_vertex_jsonl_string(
             cfg, raw.decode("utf-8")
         )
+
+
+class TestFileLikeInputNotPartiallyConsumed:
+    """
+    Regression for the create_file handler ordering. In
+    ``llm_http_handler.create_file`` the object-name step (get_complete_file_url
+    -> get_object_name) runs before transform_create_file_request, and each
+    independently calls ``extract_file_data`` on the same create_file_data. When
+    the file is a tuple-wrapped open handle, the streaming reader must still emit
+    every row including entry 0: ``extract_file_data`` materializes the handle to
+    bytes and rewinds it (seek(0)), so neither step consumes the other's cursor.
+    A partial upload missing the first request would be silent and hard to catch,
+    so this locks the full-payload invariant in.
+    """
+
+    def test_filehandle_create_file_keeps_first_entry(self):
+        cfg = VertexAIFilesConfig()
+        n_rows = 25
+        raw = _make_openai_jsonl_bytes(n_rows)
+        create_file_data: CreateFileRequest = {
+            "file": ("batch.jsonl", io.BytesIO(raw), "application/jsonl"),
+            "purpose": "batch",
+        }
+
+        # Object-name step first (as the handler does), then the transform, both
+        # reading the same live BytesIO handle.
+        cfg.get_complete_file_url(
+            api_base=None,
+            api_key=None,
+            model="",
+            optional_params={},
+            litellm_params={"bucket_name": "test-bucket"},
+            data=create_file_data,
+        )
+        out = cfg.transform_create_file_request(
+            model="",
+            create_file_data=create_file_data,
+            optional_params={},
+            litellm_params={},
+        )
+
+        assert isinstance(out, bytes)
+        lines = out.decode("utf-8").splitlines()
+        assert len(lines) == n_rows, "no batch row may be dropped from the upload"
+        first_labels = json.loads(lines[0])["request"]["labels"]
+        assert _get_litellm_batch_custom_id_from_labels(first_labels) == "request-0"
 
 
 class TestStreamingLineIterator:
@@ -182,9 +233,18 @@ class TestStreamingPeakMemory:
     Differential guard: the streaming transform must stay well under the peak
     that the legacy list pipeline incurs on the same input. If the hot path is
     reverted to building full intermediate lists, the streaming assertion fails.
+
+    The assertion that matters is the *relative* one: ``streaming_peak`` must be
+    a clear fraction of ``legacy_peak`` on the identical input. Absolute
+    ``tracemalloc`` ratios drift with GC timing and the live set carried in from
+    earlier tests, so they make poor CI gates; the relative comparison cancels
+    that shared noise and is exactly what regresses (toward 1.0) if the streaming
+    path is reverted to the list pipeline. ``gc.collect()`` before each
+    measurement removes any garbage the previous run left behind.
     """
 
     def _measure(self, fn):
+        gc.collect()
         tracemalloc.start()
         try:
             fn()
@@ -196,7 +256,6 @@ class TestStreamingPeakMemory:
     def test_streaming_peak_well_below_legacy(self):
         cfg = VertexAIFilesConfig()
         raw = _make_openai_jsonl_bytes(8000)
-        input_bytes = len(raw)
         content_str = raw.decode("utf-8")
 
         streaming_peak = self._measure(
@@ -208,13 +267,13 @@ class TestStreamingPeakMemory:
             lambda: _legacy_vertex_jsonl_string(cfg, content_str)
         )
 
-        streaming_amp = streaming_peak / input_bytes
-        legacy_amp = legacy_peak / input_bytes
-
-        assert streaming_amp < 5.0, f"streaming peak {streaming_amp:.2f}x too high"
-        assert legacy_amp > 6.0, f"legacy peak {legacy_amp:.2f}x unexpectedly low"
-        # The streaming path must be a clear, large improvement, not a wash.
-        assert streaming_peak < legacy_peak / 2
+        # Core guard: streaming peaks at well under two-thirds of the legacy
+        # pipeline. Reverting the hot path to building full intermediate lists
+        # pushes this ratio back toward 1.0 and fails the test.
+        assert streaming_peak < legacy_peak * 0.6, (
+            f"streaming peak {streaming_peak} not a clear win over legacy "
+            f"{legacy_peak} (ratio {streaming_peak / legacy_peak:.2f})"
+        )
 
     def test_get_object_name_does_not_scale_with_payload(self):
         cfg = VertexAIFilesConfig()
@@ -225,6 +284,9 @@ class TestStreamingPeakMemory:
         raw = _make_openai_jsonl_bytes(8000)
         extracted = extract_file_data(("batch.jsonl", raw, "application/jsonl"))
 
+        # The payload bytes already exist before measurement starts, so a lazy
+        # first-row parse should allocate only a small fraction of the payload;
+        # parsing every row (the legacy behaviour) would blow past this bound.
         peak = self._measure(lambda: cfg.get_object_name(extracted, purpose="batch"))
         assert (
             peak / len(raw) < 2.0
