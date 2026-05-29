@@ -112,6 +112,32 @@ def _pre_call_guardrail_blocked(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+def _rejected_before_llm_call(payload: Mapping[str, Any]) -> bool:
+    """True when the proxy rejected the request before any upstream LLM call.
+
+    Auth / budget / rate-limit / blocked-route rejections happen at the proxy
+    gate and raise ``ProxyException`` — yet litellm still emits a failure log,
+    which would otherwise produce a phantom CLIENT ``chat …`` span for a call
+    that never reached the model (e.g. a 401). LLM provider errors use litellm's
+    own exception classes (``RateLimitError``, ``APIError``, …) and record the
+    ``api_base`` they hit, so the guards below keep a genuinely-attempted call —
+    even one the proxy later wrapped in a ``ProxyException`` — from being skipped.
+    """
+    if payload.get("status") != "failure":
+        return False
+    info = payload.get("error_information")
+    error_class = info.get("error_class") if isinstance(info, Mapping) else None
+    if error_class != "ProxyException":
+        return False
+    response = payload.get("response")
+    has_response = isinstance(response, Mapping) and bool(response.get("id"))
+    hidden = payload.get("hidden_params")
+    api_base = payload.get("api_base") or (
+        hidden.get("api_base") if isinstance(hidden, Mapping) else None
+    )
+    return not has_response and not api_base
+
+
 class OpenTelemetryV2(CustomLogger):
     """The ``CustomLogger`` for OpenTelemetry.
 
@@ -209,21 +235,30 @@ class OpenTelemetryV2(CustomLogger):
         payload = kwargs.get("standard_logging_object")
         if not payload:
             return None
-        if _pre_call_guardrail_blocked(cast("Mapping[str, Any]", payload)):
+        mapping_payload = cast("Mapping[str, Any]", payload)
+        if _pre_call_guardrail_blocked(mapping_payload):
             # A pre-call guardrail blocked the request, so the upstream LLM was
             # never called — litellm still emits a failure log, but a CLIENT
             # "chat …" span for a call that didn't happen is misleading. Skip it;
             # the guardrail span (ERROR, with the verdict) is the real outcome.
             return None
+        if _rejected_before_llm_call(mapping_payload):
+            # Rejected at the proxy gate (auth/budget/rate-limit) before any LLM
+            # call — the failure log would otherwise produce a phantom CLIENT span.
+            # The server span (and auth span) already carry the failure.
+            return None
         data = LLMCallSpanData.from_standard_logging_payload(
             cast("Any", payload), capture_content=self.config.capture_span_content
         )
-        # Parent is the ambient context (the instrumentor's server span,
-        # restored by the logging worker). When the ambient context has lost the
-        # server span — e.g. pass-through logging fired from a detached task —
-        # fall back to the server span the proxy threaded through metadata so the
-        # call span still nests under the request instead of being dropped.
-        parent_ctx = resolve_parent_context(threaded=_threaded_parent_span(kwargs))
+        # The LLM call is a request-level span: parent it to the server span the
+        # proxy threads through metadata (``prefer_threaded``), not to whatever
+        # phase span is ambient. Otherwise an LLM-call log emitted while the
+        # ``auth`` phase span is active — e.g. failure logging for a request
+        # rejected at auth — would nest under ``auth`` instead of the request
+        # root. Falls back to ambient when nothing is threaded.
+        parent_ctx = resolve_parent_context(
+            threaded=_threaded_parent_span(kwargs), prefer_threaded=True
+        )
         # Write identity into Baggage so child spans (guardrails, services)
         # inherit it.
         bag = promoted_baggage(
@@ -426,8 +461,11 @@ class OpenTelemetryV2(CustomLogger):
         self._emit_guardrail_spans(request_data)
 
     def _emit_guardrail_spans(self, request_data: Mapping[str, Any]) -> None:
-        # Post-call hooks run in the request task, so the ambient context is the
-        # server span; guardrail spans parent to it implicitly via that context.
+        # The guardrail is a request-level span: parent it to the server span the
+        # proxy threaded (``prefer_threaded``), not to whatever phase span is
+        # ambient. Emit each with the guardrail's actual execution window so a
+        # pre_call guardrail is placed before the LLM call instead of at post-call
+        # emission time.
         metadata = request_data.get("metadata")
         guardrails: list[Any] = []
         if isinstance(metadata, dict):
@@ -436,14 +474,23 @@ class OpenTelemetryV2(CustomLogger):
                 guardrails = info
             elif isinstance(info, dict):
                 guardrails = [info]
+        if not guardrails:
+            return
+        parent_ctx = resolve_parent_context(
+            threaded=_threaded_parent_span(request_data), prefer_threaded=True
+        )
         for entry in guardrails:
             if not isinstance(entry, dict):
                 continue
+            data = GuardrailSpanData.from_logging_entry(
+                cast("StandardLoggingGuardrailInformation", entry)
+            )
             self._emitter.emit(
                 SpanRole.GUARDRAIL,
-                GuardrailSpanData.from_logging_entry(
-                    cast("StandardLoggingGuardrailInformation", entry)
-                ),
+                data,
+                parent_context=parent_ctx,
+                start_time_ns=to_ns(data.start_time),
+                end_time_ns=to_ns(data.end_time),
             )
 
     # ====================================================================== #

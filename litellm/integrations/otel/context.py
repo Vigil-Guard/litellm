@@ -32,20 +32,30 @@ def context_from_span(span: Span, context: Context | None = None) -> Context:
     return set_span_in_context(span, context=context)
 
 
-def resolve_parent_context(threaded: Span | None = None) -> Context:
-    """The context a child span should parent under: ambient first, then threaded.
+def resolve_parent_context(
+    threaded: Span | None = None, *, prefer_threaded: bool = False
+) -> Context:
+    """The context a child span should parent under.
 
-    Every gen-ai span parents to the ambient OTel context (the active server
-    span, restored by the logging worker or active in the request task). But that
-    context can lose the server span — e.g. logging dispatched from a detached
-    ``asyncio.create_task``, or a background service call with no request on the
-    stack. In that case fall back to the span the proxy threaded explicitly
-    (``litellm_parent_otel_span``) so the child still nests under the request
-    instead of being dropped. When neither is recordable the ambient context is
-    returned unchanged, so the span simply starts a new root trace.
+    By default this is ambient-first: parent to the active OTel context (the
+    server span, restored by the logging worker or active in the request task),
+    falling back to the span the proxy threaded explicitly
+    (``litellm_parent_otel_span``) only when the ambient context has no recordable
+    span — e.g. logging dispatched from a detached ``asyncio.create_task``, or a
+    background service call. When neither is recordable the ambient context is
+    returned unchanged, so the span starts a new root trace.
+
+    ``prefer_threaded`` flips the precedence: when the threaded span is recordable
+    it wins over ambient. Use this for **request-level** spans (the LLM call, the
+    guardrail) that must hang off the server span regardless of what phase span
+    happens to be active — otherwise a span emitted while the ``auth`` phase span
+    is active (e.g. failure logging) would nest under ``auth`` instead of the
+    request root. Service/DB spans deliberately do *not* set this, so they still
+    nest under whatever phase is active.
     """
     ctx = get_current()
-    if not is_recordable_span(get_current_span(ctx)) and is_recordable_span(threaded):
+    ambient_ok = is_recordable_span(get_current_span(ctx))
+    if is_recordable_span(threaded) and (prefer_threaded or not ambient_ok):
         ctx = context_from_span(threaded, context=ctx)  # type: ignore[arg-type]
     return ctx
 

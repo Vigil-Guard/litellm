@@ -166,6 +166,11 @@ class GuardrailSpanData:
     confidence_score: float | None = None
     risk_score: float | None = None
     duration: float | None = None
+    # Actual execution window (epoch seconds) from the logging entry, so the span
+    # is placed when the guardrail really ran — a pre_call guardrail before the
+    # LLM call — rather than at post-call emission time.
+    start_time: float | None = None
+    end_time: float | None = None
     # Provider-agnostic configuration/detection metadata (see
     # ``StandardLoggingGuardrailInformation``). Present for any guardrail that
     # populates them, not just one provider's shape.
@@ -212,6 +217,8 @@ class GuardrailSpanData:
             confidence_score=as_float(get("confidence_score")),
             risk_score=as_float(get("risk_score")),
             duration=as_float(get("duration")),
+            start_time=as_float(get("start_time")),
+            end_time=as_float(get("end_time")),
             guardrail_id=as_str(get("guardrail_id")),
             policy_template=as_str(get("policy_template")),
             detection_method=as_str(get("detection_method")),

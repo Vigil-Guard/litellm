@@ -140,25 +140,28 @@ def test_passthrough_llm_span_uses_threaded_parent_without_ambient_context():
     assert llm_span.parent.span_id == server.get_span_context().span_id
 
 
-def test_ambient_server_span_wins_over_threaded_parent():
-    """When the ambient context still carries a server span, it is used as the
-    parent (threaded fallback only kicks in when ambient is missing)."""
+def test_threaded_server_span_wins_for_llm_call():
+    """The LLM call is a request-level span: it parents to the threaded server
+    span (the request root), not whatever span is ambient. This keeps it out of a
+    phase span (e.g. ``auth``) that may be active when failure logging fires —
+    the auth-failure 401 case, where the LLM-call log was nesting under ``auth``."""
     logger, exporter = _logger()
-    ambient = logger._emitter.start_span(
+    # Ambient = an active phase span (auth); request root threaded explicitly.
+    ambient = logger._emitter.start_span(SpanRole.SERVICE, "auth /v1/chat/completions")
+    request_root = logger._emitter.start_span(
         SpanRole.PROXY_REQUEST, LITELLM_PROXY_REQUEST_SPAN_NAME
     )
-    other = logger._emitter.start_span(SpanRole.PROXY_REQUEST, "other-span")
     kwargs = {
         "standard_logging_object": _payload(),
-        "litellm_params": {"metadata": {"litellm_parent_otel_span": other}},
+        "litellm_params": {"metadata": {"litellm_parent_otel_span": request_root}},
     }
     with trace.use_span(ambient, end_on_exit=False):
         asyncio.run(logger.async_log_success_event(kwargs, None, None, None))
     ambient.end()
-    other.end()
+    request_root.end()
     by_name = {s.name: s for s in exporter.get_finished_spans()}
     llm_span = by_name["chat gpt-4o"]
-    assert llm_span.parent.span_id == ambient.get_span_context().span_id
+    assert llm_span.parent.span_id == request_root.get_span_context().span_id
 
 
 # --------------------------------------------------------------------------- #
